@@ -66,6 +66,14 @@ COMMON_HEADERS = {
                   "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 10; Nexus 5X Build/QQ3A.200805.001)",
                  }
 
+
+def _build_headers(token_data):
+   headers = dict(COMMON_HEADERS)
+   if token_data.get("mag-identifier"):
+      headers["mag-identifier"] = token_data["mag-identifier"]
+   headers["Authorization"] = "Bearer " + token_data["access_token"]
+   return headers
+
 # Logging config
 FORMAT = "[%(asctime)s:%(levelname)s] %(message)s"
 log.basicConfig(format=FORMAT, datefmt="%Y-%m-%d %H:%M:%S", level=log.INFO)
@@ -114,7 +122,7 @@ class CareLinkClient(object):
             log.error("ERROR: failed parsing token file %s" % filename)
 
          if token_data is not None:
-            required_fields = ["access_token", "refresh_token", "scope", "client_id", "client_secret", "mag-identifier"]
+            required_fields = ["access_token", "refresh_token", "scope", "client_id", "client_secret"]
             for f in required_fields:
                if f not in token_data:
                   log.error("ERROR: field %s is missing from token file" % f)
@@ -174,9 +182,7 @@ class CareLinkClient(object):
    def _get_user(self, config, token_data):
       log.info("_get_user()")
       url = config["baseUrlCareLink"] + "/users/me"
-      headers = COMMON_HEADERS
-      headers["mag-identifier"] = token_data["mag-identifier"]
-      headers["Authorization"] = "Bearer " + token_data["access_token"]
+      headers = _build_headers(token_data)
       self.__last_api_status = None
       resp = requests.get(url=url,headers=headers)
       self.__last_api_status = resp.status_code
@@ -193,9 +199,7 @@ class CareLinkClient(object):
    def _get_patient(self, config, token_data):
       log.info("_get_patient()")
       url = config["baseUrlCareLink"] + "/links/patients"
-      headers = COMMON_HEADERS
-      headers["mag-identifier"] = token_data["mag-identifier"]
-      headers["Authorization"] = "Bearer " + token_data["access_token"]
+      headers = _build_headers(token_data)
       self.__last_api_status = None
       resp = requests.get(url=url,headers=headers)
       self.__last_api_status = resp.status_code
@@ -212,9 +216,7 @@ class CareLinkClient(object):
    def _get_data(self, config, token_data, username, role, patientid):
       log.info("_get_data()")
       url = config["baseUrlCumulus"] + "/display/message"
-      headers = COMMON_HEADERS
-      headers["mag-identifier"] = token_data["mag-identifier"]
-      headers["Authorization"] = "Bearer " + token_data["access_token"]
+      headers = _build_headers(token_data)
       data = {}
       data["username"] = username
       if role in ["CARE_PARTNER","CARE_PARTNER_OUS"]:
@@ -248,9 +250,9 @@ class CareLinkClient(object):
          "client_secret": token_data["client_secret"],
          "grant_type":    "refresh_token"
          }
-      headers = {
-         "mag-identifier": token_data["mag-identifier"]
-         }
+      headers = {}
+      if token_data.get("mag-identifier"):
+         headers["mag-identifier"] = token_data["mag-identifier"]
       resp = requests.post(url=token_url, headers=headers, data=data)
       log.debug("   status: %d" % resp.status_code)
       if resp.status_code != 200:

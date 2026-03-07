@@ -145,6 +145,13 @@ def write_datafile(obj, filename):
 
 def do_login(endpoint_config):
 	sso_config, api_base_url = endpoint_config
+	if "oauth" not in sso_config or "mag" not in sso_config:
+		return do_login_oauth20(sso_config, api_base_url)
+
+	return do_login_legacy(sso_config, api_base_url)
+
+
+def do_login_legacy(sso_config, api_base_url):
 	# step 1 initialize
 	data = {
 		'client_id': sso_config['oauth']['client']['client_ids'][0]['client_id'],
@@ -155,6 +162,8 @@ def do_login(endpoint_config):
 	}
 	client_init_url = api_base_url + sso_config["mag"]["system_endpoints"]["client_credential_init_endpoint_path"]
 	client_init_req = requests.post(client_init_url, data=data, headers=headers)
+	if client_init_req.status_code != 200:
+		raise Exception(f"Could not initialize legacy login flow ({client_init_req.status_code}): {client_init_req.text[:200]}")
 	client_init_response = json.loads(client_init_req.text)
 
 	# step 2 authorize
@@ -176,7 +185,10 @@ def do_login(endpoint_config):
 	 	'state': client_state
 	}
 	authorize_url = api_base_url + sso_config["oauth"]["system_endpoints"]["authorization_endpoint_path"]
-	providers = json.loads(requests.get(authorize_url, params=auth_params).text) # this will redirect
+	providers_req = requests.get(authorize_url, params=auth_params)
+	if providers_req.status_code != 200:
+		raise Exception(f"Could not authorize legacy login flow ({providers_req.status_code}): {providers_req.text[:200]}")
+	providers = json.loads(providers_req.text) # this will redirect
 	captcha_url = providers["providers"][0]["provider"]["auth_url"]
 
 	# step 3 captcha login and consent
@@ -241,6 +253,71 @@ def do_login(endpoint_config):
 	write_datafile(token_data, logindata_file)
 	return token_data
 
+
+def do_login_oauth20(sso_config, api_base_url):
+	client_config = sso_config["client"]
+
+	client_code_verifier = base64.urlsafe_b64encode(os.urandom(40)).decode('utf-8')
+	client_code_verifier = re.sub('[^a-zA-Z0-9]+', '', client_code_verifier)
+	client_code_challange = hashlib.sha256(client_code_verifier.encode('utf-8')).digest()
+	client_code_challange = base64.urlsafe_b64encode(client_code_challange).decode('utf-8')
+	client_code_challange = client_code_challange.replace('=', '')
+
+	client_state = random_b64_str(22)
+	auth_params = {
+		'client_id': client_config['client_id'],
+		'response_type': 'code',
+		'display': 'social_login',
+		'scope': client_config['scope'],
+		'redirect_uri': client_config['redirect_uri'],
+		'code_challenge': client_code_challange,
+		'code_challenge_method': 'S256',
+		'state': client_state
+	}
+	authorize_url = api_base_url + sso_config["system_endpoints"]["authorization_endpoint_path"]
+	providers_req = requests.get(authorize_url, params=auth_params)
+	if providers_req.status_code != 200:
+		raise Exception(f"Could not authorize OAuth2.0 login flow ({providers_req.status_code}): {providers_req.text[:200]}")
+	providers = json.loads(providers_req.text)
+	captcha_url = providers["providers"][0]["provider"]["auth_url"]
+
+	print(f"captcha url: {captcha_url}")
+	auth_code, auth_state = do_captcha(captcha_url, client_config['redirect_uri'])
+	if auth_state != client_state:
+		raise Exception("OAuth state mismatch")
+
+	token_req_url = api_base_url + sso_config["system_endpoints"]["token_endpoint_path"]
+	token_req_data = {
+		"code": auth_code,
+		"client_id": client_config['client_id'],
+		"client_secret": client_config.get('client_secret', ''),
+		"redirect_uri": client_config['redirect_uri'],
+		"code_verifier": client_code_verifier,
+		"grant_type": "authorization_code"
+	}
+	token_req = requests.post(token_req_url, data=token_req_data)
+	if token_req.status_code != 200:
+		print(f"\n\n{curlify.to_curl(token_req.request)}")
+		raise Exception("Could not get token data")
+
+	token_data = json.loads(token_req.text)
+	print(f"got token data from server")
+
+	token_data["client_id"] = token_req_data["client_id"]
+	token_data["client_secret"] = token_req_data["client_secret"]
+	token_data["scope"] = token_data.get("scope", client_config.get("scope", ""))
+	if "expires_in" in token_data:
+		del token_data["expires_in"]
+	if "token_type" in token_data:
+		del token_data["token_type"]
+
+	mag_identifier = token_req.headers.get("mag-identifier")
+	if mag_identifier:
+		token_data["mag-identifier"] = mag_identifier
+
+	write_datafile(token_data, logindata_file)
+	return token_data
+
 def read_data_file(file):
 	token_data = None
 	if os.path.isfile(file):
@@ -250,7 +327,7 @@ def read_data_file(file):
 			print("failed parsing json")
 	
 		if token_data is not None:
-			required_fields = ["access_token", "refresh_token", "scope", "client_id", "client_secret", "mag-identifier"]
+			required_fields = ["access_token", "refresh_token", "scope", "client_id", "client_secret"]
 			for i in required_fields:
 				if i not in token_data:
 					print(f"field {i} is missing from data file")
@@ -260,7 +337,7 @@ def read_data_file(file):
 # config
 is_debug = False
 logindata_file = 'logindata.json'
-discovery_url = 'https://clcloud.minimed.eu/connect/carepartner/v11/discover/android/3.2'
+discovery_url = 'https://clcloud.minimed.eu/connect/carepartner/v11/discover/android/3.3'
 rsa_keysize = 2048
 
 def main(is_us_region):
@@ -277,8 +354,9 @@ def main(is_us_region):
 		print(f"token data file already exists")
 
 # Parse command line
-parser = argparse.ArgumentParser()
-parser.add_argument('--us', help='Specify US region', default=False, action='store_true')
-args = parser.parse_args()
+if __name__ == "__main__":
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--us', help='Specify US region', default=False, action='store_true')
+	args = parser.parse_args()
 
-main(args.us)
+	main(args.us)

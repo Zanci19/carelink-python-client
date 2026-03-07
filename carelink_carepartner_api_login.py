@@ -29,7 +29,7 @@
 #     This script needs the following additional Python packages:
 #     - curlify
 #     - OpenSSL
-#     - seleniumwire
+#     - selenium
 #
 ###############################################################################
 import argparse
@@ -49,9 +49,9 @@ import requests
 
 import curlify
 import OpenSSL
-from seleniumwire import webdriver
+from selenium import webdriver
 from selenium.common.exceptions import NoSuchWindowException, WebDriverException
-from urllib.parse import urlencode, parse_qs
+from urllib.parse import urlencode, parse_qs, unquote
 
 
 def setup_logging():
@@ -111,23 +111,9 @@ def do_captcha(url, redirect_url):
 	driver.get(url)
 
 	while True:
-		for request in driver.requests:
-			if request.response:
-				if request.response.status_code in (301, 302, 303):
-					if "location" in request.response.headers:
-						location = request.response.headers["location"]
-						if redirect_url in location:
-							query = location.split('?', 1)[-1] if '?' in location else ''
-							params = parse_qs(query)
-							code = params.get('code', [None])[0]
-							state = params.get('state', [None])[0]
-							if code is None or state is None:
-								raise Exception(f"Missing 'code' or 'state' in redirect URL: {location}")
-							driver.quit()
-							return (code, state)
-		# Also check current URL for custom scheme redirects (e.g. com.medtronic.carepartner:/sso)
 		try:
 			current_url = driver.current_url
+			# Case 1: Browser navigated directly to the redirect URL (HTTPS redirects)
 			if redirect_url in current_url:
 				query = current_url.split('?', 1)[-1] if '?' in current_url else ''
 				params = parse_qs(query)
@@ -137,6 +123,24 @@ def do_captcha(url, redirect_url):
 					raise Exception(f"Missing 'code' or 'state' in redirect URL: {current_url}")
 				driver.quit()
 				return (code, state)
+			# Case 2: Firefox error page for unknown protocol (custom URI scheme redirects,
+			# e.g. com.medtronic.carepartner:/sso). Firefox shows about:neterror with the
+			# original redirect URL encoded in the 'u' query parameter.
+			if current_url.startswith('about:neterror'):
+				error_qs = current_url.split('?', 1)[-1] if '?' in current_url else ''
+				error_params = parse_qs(error_qs)
+				original_url = error_params.get('u', [None])[0]
+				if original_url:
+					decoded_url = unquote(original_url)
+					if redirect_url in decoded_url:
+						query = decoded_url.split('?', 1)[-1] if '?' in decoded_url else ''
+						params = parse_qs(query)
+						code = params.get('code', [None])[0]
+						state = params.get('state', [None])[0]
+						if code is None or state is None:
+							raise Exception(f"Missing 'code' or 'state' in redirect URL: {decoded_url}")
+						driver.quit()
+						return (code, state)
 		except (NoSuchWindowException, WebDriverException):
 			pass
 		sleep(0.1)

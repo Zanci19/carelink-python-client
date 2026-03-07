@@ -29,7 +29,7 @@
 #     This script needs the following additional Python packages:
 #     - curlify
 #     - OpenSSL
-#     - seleniumwire
+#     - selenium
 #
 ###############################################################################
 import argparse
@@ -49,7 +49,9 @@ import requests
 
 import curlify
 import OpenSSL
-from seleniumwire import webdriver
+from selenium import webdriver
+from selenium.common.exceptions import NoSuchWindowException, WebDriverException
+from urllib.parse import urlencode, parse_qs, unquote
 
 
 def setup_logging():
@@ -109,16 +111,38 @@ def do_captcha(url, redirect_url):
 	driver.get(url)
 
 	while True:
-		for request in driver.requests:  
-			if request.response:  
-				if request.response.status_code == 302:
-					if "location" in request.response.headers:
-						location = request.response.headers["location"]
-						if redirect_url in location:
-							code = re.search(r"code=(.*)&", location).group(1)
-							state = re.search(r"state=(.*)", location).group(1)
-							driver.quit()
-							return (code, state)
+		try:
+			current_url = driver.current_url
+			# Case 1: Browser navigated directly to the redirect URL (HTTPS redirects)
+			if redirect_url in current_url:
+				query = current_url.split('?', 1)[-1] if '?' in current_url else ''
+				params = parse_qs(query)
+				code = params.get('code', [None])[0]
+				state = params.get('state', [None])[0]
+				if code is None or state is None:
+					raise Exception(f"Missing 'code' or 'state' in redirect URL: {current_url}")
+				driver.quit()
+				return (code, state)
+			# Case 2: Firefox error page for unknown protocol (custom URI scheme redirects,
+			# e.g. com.medtronic.carepartner:/sso). Firefox shows about:neterror with the
+			# original redirect URL encoded in the 'u' query parameter.
+			if current_url.startswith('about:neterror'):
+				error_qs = current_url.split('?', 1)[-1] if '?' in current_url else ''
+				error_params = parse_qs(error_qs)
+				original_url = error_params.get('u', [None])[0]
+				if original_url:
+					decoded_url = unquote(original_url)
+					if redirect_url in decoded_url:
+						query = decoded_url.split('?', 1)[-1] if '?' in decoded_url else ''
+						params = parse_qs(query)
+						code = params.get('code', [None])[0]
+						state = params.get('state', [None])[0]
+						if code is None or state is None:
+							raise Exception(f"Missing 'code' or 'state' in redirect URL: {decoded_url}")
+						driver.quit()
+						return (code, state)
+		except (NoSuchWindowException, WebDriverException):
+			pass
 		sleep(0.1)
 
 def resolve_endpoint_config(discovery_url, is_us_region=False):
@@ -267,7 +291,6 @@ def do_login_oauth20(sso_config, api_base_url):
 	auth_params = {
 		'client_id': client_config['client_id'],
 		'response_type': 'code',
-		'display': 'social_login',
 		'scope': client_config['scope'],
 		'redirect_uri': client_config['redirect_uri'],
 		'code_challenge': client_code_challange,
@@ -275,14 +298,10 @@ def do_login_oauth20(sso_config, api_base_url):
 		'state': client_state
 	}
 	authorize_url = api_base_url + sso_config["system_endpoints"]["authorization_endpoint_path"]
-	providers_req = requests.get(authorize_url, params=auth_params)
-	if providers_req.status_code != 200:
-		raise Exception(f"Could not authorize OAuth2.0 login flow ({providers_req.status_code}): {providers_req.text[:200]}")
-	providers = json.loads(providers_req.text)
-	captcha_url = providers["providers"][0]["provider"]["auth_url"]
+	full_auth_url = authorize_url + '?' + urlencode(auth_params)
 
-	print(f"captcha url: {captcha_url}")
-	auth_code, auth_state = do_captcha(captcha_url, client_config['redirect_uri'])
+	print(f"authorization url: {full_auth_url}")
+	auth_code, auth_state = do_captcha(full_auth_url, client_config['redirect_uri'])
 	if auth_state != client_state:
 		raise Exception("OAuth state mismatch")
 

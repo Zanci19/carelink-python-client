@@ -108,7 +108,14 @@ def do_captcha(url, redirect_url):
 	print("opening Firefox instance...")
 	print("Warning: you may need to close Firefox if it's already running or nothing happens!")
 	driver = webdriver.Firefox()
-	driver.get(url)
+	try:
+		driver.get(url)
+	except WebDriverException:
+		# In Selenium 4.x, driver.get() raises WebDriverException when Firefox lands on an
+		# about:neterror page (e.g. a connection failure to the authorization server). The
+		# while loop below inspects driver.current_url to determine what happened and raises
+		# an appropriate error. All other WebDriverException causes are surfaced by the loop.
+		pass
 
 	while True:
 		try:
@@ -119,9 +126,9 @@ def do_captcha(url, redirect_url):
 				params = parse_qs(query)
 				code = params.get('code', [None])[0]
 				state = params.get('state', [None])[0]
+				driver.quit()
 				if code is None or state is None:
 					raise Exception(f"Missing 'code' or 'state' in redirect URL: {current_url}")
-				driver.quit()
 				return (code, state)
 			# Case 2: Firefox error page for unknown protocol (custom URI scheme redirects,
 			# e.g. com.medtronic.carepartner:/sso). Firefox shows about:neterror with the
@@ -137,12 +144,24 @@ def do_captcha(url, redirect_url):
 						params = parse_qs(query)
 						code = params.get('code', [None])[0]
 						state = params.get('state', [None])[0]
+						driver.quit()
 						if code is None or state is None:
 							raise Exception(f"Missing 'code' or 'state' in redirect URL: {decoded_url}")
-						driver.quit()
 						return (code, state)
-		except (NoSuchWindowException, WebDriverException):
-			pass
+					else:
+						# The error page is for the authorization URL itself, not for the
+						# OAuth redirect URI. This indicates a network connectivity problem.
+						error_desc = unquote(error_params.get('d', ['Network error (details unavailable)'])[0])
+						driver.quit()
+						raise Exception(f"Browser could not reach the authorization server (check network connectivity): {error_desc}")
+		except NoSuchWindowException:
+			try:
+				driver.quit()
+			except Exception:
+				pass
+			raise Exception("Browser window was closed before login was completed.")
+		except WebDriverException:
+			pass  # Transient error during page navigation; retry on next iteration
 		sleep(0.1)
 
 def resolve_endpoint_config(discovery_url, is_us_region=False):
